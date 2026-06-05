@@ -1,0 +1,33 @@
+# === 機密 (務必不要提交！包含 CWA token / Telegram bot token) ===
+.env
+.env.*
+!.env.example
+
+# === 執行期產生的資料 ===
+subscribers.json
+data/
+radar_today.gif
+radar_anim.gif
+*.gif
+
+# === 雷達原始/中繼資料 ===
+frames.npz
+*.npz
+response_*.json
+
+# === 產生的圖片 ===
+*.png
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# === 作業系統 ===
+.DS_Store
+Thumbs.db

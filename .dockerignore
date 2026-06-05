@@ -1,0 +1,14 @@
+# 不需要進 image 的東西
+.git
+__pycache__/
+*.pyc
+*.gif
+*.png
+*.npz
+frames.npz
+subscribers.json
+response_*.json
+README.md
+plot_radar.py
+download_radar.py
+animate_radar.py

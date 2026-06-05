@@ -1,0 +1,13 @@
+services:
+  weatherbot:
+    build: .
+    container_name: weatherbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - botdata:/data          # 持久化 subscribers.json
+    # 機器人走 polling，不需開放埠口
+
+volumes:
+  botdata:
