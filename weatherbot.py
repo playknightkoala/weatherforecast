@@ -251,13 +251,15 @@ async def daily_push(ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- 定期清除產生的資料 ----------
 def _sweep_old_files():
     """成品影片較大且每 10 分鐘即過期, 超過 CLEAN_AGE_HOURS 就刪;
-    逐幀 npz 很小且整天可重用, 保留較久 (跨日另由 _prune_other_days 處理)。"""
+    逐幀 npz 很小且在 12 小時滾動視窗內可重用 (過期者另由 cwa._prune_expired
+    依資料時間精準清除, 這裡只是 mtime 後援, 清掉長期未碰的孤兒檔)。"""
     now = time.time()
     removed = 0
     rules = [                                   # (glob, 最大保留小時)
         (os.path.join(RADAR_CACHE_DIR, "rvideo_*"), CLEAN_AGE_HOURS),
         (os.path.join(HERE, "radar_today*"), CLEAN_AGE_HOURS),
-        (os.path.join(RADAR_CACHE_DIR, "rframe_*.npz"), 20),
+        (os.path.join(RADAR_CACHE_DIR, "rframe_*.npz"), cwa.RADAR_HOURS),
+        (os.path.join(RADAR_CACHE_DIR, "rpng_*.png"), cwa.RADAR_HOURS),
     ]
     for pat, age_h in rules:
         cutoff = now - age_h * 3600

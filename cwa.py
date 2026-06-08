@@ -13,7 +13,8 @@ import glob
 import json
 import subprocess
 import tempfile
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -58,10 +59,18 @@ def _curl(url, binary_out=None):
 
 
 def today_range():
-    """回傳今天 (Asia/Taipei) 的 timeFrom, timeTo 字串。"""
+    """回傳今天 (Asia/Taipei) 的 timeFrom, timeTo 字串 (天氣預報用)。"""
     now = datetime.now(TZ)
     d = now.strftime("%Y-%m-%d")
     return f"{d}T00:00:00", f"{d}T23:59:59"
+
+
+def recent_range(hours=RADAR_HOURS):
+    """回傳最近 hours 小時的 (timeFrom, timeTo) 字串 (Asia/Taipei)。
+    滾動視窗, 會跨日 (例如早上 8 點 -> 昨天 8 點 ~ 今天 8 點)。"""
+    now = datetime.now(TZ)
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    return (now - timedelta(hours=hours)).strftime(fmt), now.strftime(fmt)
 
 
 def list_counties():
@@ -136,7 +145,7 @@ RADAR_FPS = 10              # 影片每秒幀數
 
 
 def _radar_metadata():
-    tf, tt = today_range()
+    tf, tt = recent_range()        # 最近 12 小時 (滾動視窗, 會跨日)
     auth = _auth()
     url = (f"https://opendata.cwa.gov.tw/historyapi/v1/getMetadata/{RADAR_ID}"
            f"?Authorization={auth}&timeFrom={tf}&timeTo={tt}")
@@ -155,49 +164,68 @@ def _key(dt):
     return dt[:16].replace("-", "").replace("T", "_").replace(":", "")
 
 
-def _daykey(dt):
-    return dt[:10].replace("-", "")
-
-
-def _prune_other_days(cache_dir, today):
-    """刪除非今日的快取檔 (跨日自動清除)。"""
+def _prune_expired(cache_dir, cutoff):
+    """刪除資料時間早於 cutoff 的快取檔 (滾動視窗, 與日期無關)。
+    檔名內嵌資料時間 (rframe_YYYYMMDD_HHMM / rvideo_<slug>_YYYYMMDD_HHMM_n),
+    比 cutoff 舊的就刪, 比 cutoff 新的不動。"""
     for f in (glob.glob(os.path.join(cache_dir, "rframe_*.npz"))
+              + glob.glob(os.path.join(cache_dir, "rpng_*.png"))
               + glob.glob(os.path.join(cache_dir, "rvideo_*"))):
-        m = re.search(r"_(\d{8})_", os.path.basename(f))
-        if m and m.group(1) != today:
+        m = re.search(r"(\d{8})_(\d{4})", os.path.basename(f))
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1) + m.group(2),
+                                   "%Y%m%d%H%M").replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        if ts < cutoff:
             try:
                 os.remove(f)
             except OSError:
                 pass
 
 
-def _load_or_download(sel, cache_dir):
-    """逐幀取得格點: 已快取者直接讀, 未快取者才下載並寫入快取。
-    回傳 (grids, dts, 新下載數)。"""
+DOWNLOAD_WORKERS = 8           # 下載並行數 (每幀 XML ~9MB, 序列太慢)
+
+
+def _fetch_one(e, cache_dir):
+    """取得單一幀格點: 命中 npz 快取直接讀, 否則下載並寫入快取。
+    回傳 (dt, grid, 是否為新下載); 失敗回傳 None。執行緒安全 (各用獨立 temp 檔)。"""
     from radar_common import parse_grid_only
-    grids, dts, n_new = [], [], 0
-    tmp = os.path.join(tempfile.gettempdir(), "_radar_bot.xml")
-    for e in sel:
-        dt = e["DateTime"]
-        fp = os.path.join(cache_dir, f"rframe_{_key(dt)}.npz")
-        if os.path.exists(fp):                       # 命中快取, 不重打 API
-            try:
-                grids.append(np.load(fp)["g"].astype(np.float32))
-                dts.append(dt)
-                continue
-            except Exception:
-                pass                                 # 快取毀損則重抓
-        try:                                         # 下載缺少的幀
-            _curl(e["ProductURL"], tmp)
-            g, gdt = parse_grid_only(tmp)
-            grids.append(g.astype(np.float32))
-            dts.append(gdt)
-            np.savez_compressed(fp, g=g.astype(np.float16))
-            n_new += 1
+    dt = e["DateTime"]
+    fp = os.path.join(cache_dir, f"rframe_{_key(dt)}.npz")
+    if os.path.exists(fp):                           # 命中快取, 不重打 API
+        try:
+            return dt, np.load(fp)["g"].astype(np.float32), False
         except Exception:
+            pass                                     # 快取毀損則重抓
+    tmp = os.path.join(tempfile.gettempdir(), f"_radar_{_key(dt)}.xml")
+    try:                                             # 下載缺少的幀
+        _curl(e["ProductURL"], tmp)
+        g, gdt = parse_grid_only(tmp)
+        np.savez_compressed(fp, g=g.astype(np.float16))
+        return gdt, g.astype(np.float32), True
+    except Exception:
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _load_or_download(sel, cache_dir, workers=DOWNLOAD_WORKERS):
+    """並行取得各幀格點 (已快取者直接讀, 缺少者才下載)。維持時間順序。
+    回傳 (grids, dts, 新下載數)。"""
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(lambda e: _fetch_one(e, cache_dir), sel))  # 保序
+    grids, dts, n_new = [], [], 0
+    for r in results:
+        if r is None:                                # 該幀下載/解析失敗, 跳過
             continue
-    if os.path.exists(tmp):
-        os.remove(tmp)
+        dt, g, is_new = r
+        dts.append(dt)
+        grids.append(g)
+        n_new += int(is_new)
     if not grids:
         raise RuntimeError("雷達資料下載失敗")
     return grids, dts, n_new
@@ -236,7 +264,7 @@ def build_today_radar(cache_dir="radarcache", region="全台",
         raise RuntimeError("當天尚無雷達資料")
     sel = _select_frames(times)
     t0, t1 = sel[0]["DateTime"], sel[-1]["DateTime"]
-    _prune_other_days(cache_dir, _daykey(t1))
+    _prune_expired(cache_dir, datetime.now(TZ) - timedelta(hours=RADAR_HOURS))
 
     # 同時段影片快取: 鍵 = 區域 + 最新幀時間 + 幀數 (逐幀 npz 與區域無關, 跨區共用)
     ext = "mp4" if shutil.which("ffmpeg") else "gif"
@@ -246,54 +274,65 @@ def build_today_radar(cache_dir="radarcache", region="全台",
 
     grids, dts, n_new = _load_or_download(sel, cache_dir)
     out = video
-    cmap, norm = make_cmap()
 
-    # 依區域視野比例決定圖面尺寸, 減少留白
-    lon_span = view[1] - view[0]
-    lat_span = view[3] - view[2]
-    w_geo = lon_span * float(np.cos(np.radians((view[2] + view[3]) / 2)))
-    map_h = 8.0
-    map_w = max(3.5, min(10.0, map_h * w_geo / lat_span))
+    # 每幀 PNG 快取 (鍵 = 區域 + 幀時間 + dpi)。底圖/算圖最貴, 只畫缺少的幀;
+    # 新幀進來時舊幀 PNG 沿用, 等於只重算 1 張再重新組裝影片。
+    png_paths = [os.path.join(cache_dir, f"rpng_{slug}_{_key(dt)}_{dpi}.png")
+                 for dt in dts]
+    missing = [i for i, p in enumerate(png_paths) if not os.path.exists(p)]
 
-    # 靜態底圖只建一次, 之後每幀只換資料與時間, 存高解析 PNG
-    fig = plt.figure(figsize=(map_w + 2.2, map_h), dpi=dpi)
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent(view, crs=ccrs.PlateCarree())
-    ax.set_facecolor("#0a1a33")
-    ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="#0a1a33")
-    ax.add_feature(cfeature.LAND.with_scale("10m"), facecolor="#2b2b2b")
-    ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="white", linewidth=0.7)
-    ax.add_feature(cfeature.STATES.with_scale("10m"), edgecolor="white", linewidth=0.5, alpha=0.6)
-    gl = ax.gridlines(draw_labels=True, color="white", alpha=0.2, linewidth=0.4)
-    gl.top_labels = gl.right_labels = False
-    gl.xlabel_style = gl.ylabel_style = GRIDLABEL_STYLE      # 經緯度標籤白色
-    title = "整合雷達回波圖  O-A0059-001" if region == "全台" else f"整合雷達回波圖（{region}）"
-    ax.set_title(title, fontsize=13, pad=8, color="white")
-    # bilinear 內插讓回波更平滑, 不再有明顯格點塊狀
-    im = ax.imshow(grids[0], origin="lower", extent=EXTENT, transform=ccrs.PlateCarree(),
-                   cmap=cmap, norm=norm, interpolation="bilinear", zorder=5)
-    cbar = fig.colorbar(im, ax=ax, ticks=DBZ_BOUNDS, shrink=0.8, pad=0.04)
-    cbar.set_label("回波強度 (dBZ)", color="white")          # 色階標題白色
-    cbar.ax.tick_params(colors="white")                      # 色階刻度白色
-    cbar.outline.set_edgecolor("white")
-    badge = ax.text(0.015, 0.97, "", transform=ax.transAxes, fontsize=13, color="white",
-                    va="top", ha="left", zorder=10,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="#1565C0", ec="none", alpha=0.9))
+    if missing:
+        cmap, norm = make_cmap()
+        # 依區域視野比例決定圖面尺寸, 減少留白
+        lon_span = view[1] - view[0]
+        lat_span = view[3] - view[2]
+        w_geo = lon_span * float(np.cos(np.radians((view[2] + view[3]) / 2)))
+        map_h = 8.0
+        map_w = max(3.5, min(10.0, map_h * w_geo / lat_span))
 
-    png_dir = tempfile.mkdtemp(prefix="radarpng_")
-    try:
-        for i, (g, dt) in enumerate(zip(grids, dts)):
-            im.set_data(g)
-            badge.set_text(str(dt).replace("T", " ")[:16])
-            fig.savefig(os.path.join(png_dir, f"f{i:04d}.png"),
-                        dpi=dpi, facecolor="#0a1a33")  # 不用 bbox_inches=tight, 確保每幀同尺寸
+        # 靜態底圖只建一次, 之後每幀只換資料與時間, 存高解析 PNG
+        fig = plt.figure(figsize=(map_w + 2.2, map_h), dpi=dpi)
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        ax.set_extent(view, crs=ccrs.PlateCarree())
+        ax.set_facecolor("#0a1a33")
+        ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="#0a1a33")
+        ax.add_feature(cfeature.LAND.with_scale("10m"), facecolor="#2b2b2b")
+        ax.add_feature(cfeature.COASTLINE.with_scale("10m"), edgecolor="white", linewidth=0.7)
+        ax.add_feature(cfeature.STATES.with_scale("10m"), edgecolor="white", linewidth=0.5, alpha=0.6)
+        gl = ax.gridlines(draw_labels=True, color="white", alpha=0.2, linewidth=0.4)
+        gl.top_labels = gl.right_labels = False
+        gl.xlabel_style = gl.ylabel_style = GRIDLABEL_STYLE      # 經緯度標籤白色
+        title = "整合雷達回波圖  O-A0059-001" if region == "全台" else f"整合雷達回波圖（{region}）"
+        ax.set_title(title, fontsize=13, pad=8, color="white")
+        # bilinear 內插讓回波更平滑, 不再有明顯格點塊狀
+        im = ax.imshow(grids[missing[0]], origin="lower", extent=EXTENT,
+                       transform=ccrs.PlateCarree(),
+                       cmap=cmap, norm=norm, interpolation="bilinear", zorder=5)
+        cbar = fig.colorbar(im, ax=ax, ticks=DBZ_BOUNDS, shrink=0.8, pad=0.04)
+        cbar.set_label("回波強度 (dBZ)", color="white")          # 色階標題白色
+        cbar.ax.tick_params(colors="white")                      # 色階刻度白色
+        cbar.outline.set_edgecolor("white")
+        badge = ax.text(0.015, 0.97, "", transform=ax.transAxes, fontsize=13, color="white",
+                        va="top", ha="left", zorder=10,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="#1565C0", ec="none", alpha=0.9))
+        for i in missing:
+            im.set_data(grids[i])
+            badge.set_text(str(dts[i]).replace("T", " ")[:16])
+            fig.savefig(png_paths[i], dpi=dpi, facecolor="#0a1a33")  # 不用 bbox_inches=tight, 確保每幀同尺寸
         plt.close(fig)
+
+    # 用穩定命名的 symlink 連到快取 PNG (維持時間順序), 再餵給 ffmpeg/PIL
+    present = [p for p in png_paths if os.path.exists(p)]
+    seq_dir = tempfile.mkdtemp(prefix="radarseq_")
+    try:
+        for i, p in enumerate(present):
+            os.symlink(os.path.abspath(p), os.path.join(seq_dir, f"f{i:04d}.png"))
 
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             # H.264 高畫質; scale 濾鏡確保寬高為偶數 (yuv420p 必要)
             cmd = [ffmpeg, "-y", "-framerate", str(fps),
-                   "-i", os.path.join(png_dir, "f%04d.png"),
+                   "-i", os.path.join(seq_dir, "f%04d.png"),
                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
                    "-movflags", "+faststart", out]
@@ -301,12 +340,11 @@ def build_today_radar(cache_dir="radarcache", region="全台",
         else:
             # 無 ffmpeg: 退回 GIF (out 已是 .gif)
             from PIL import Image
-            frames = [Image.open(os.path.join(png_dir, f"f{i:04d}.png")).convert("P")
-                      for i in range(len(grids))]
+            frames = [Image.open(p).convert("P") for p in present]
             frames[0].save(out, save_all=True, append_images=frames[1:],
                            duration=int(1000 / fps), loop=0)
     finally:
-        shutil.rmtree(png_dir, ignore_errors=True)
+        shutil.rmtree(seq_dir, ignore_errors=True)
 
     return out, len(grids), dts[0], dts[-1], False
 
