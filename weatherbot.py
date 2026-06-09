@@ -181,11 +181,16 @@ async def _send_radar(ctx, chat_id, region):
     """產生並傳送指定區域的雷達回波影片。"""
     await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     try:
+        t_gen = time.monotonic()
         sent, n, t0, t1, cached = await asyncio.to_thread(
             cwa.build_today_radar, RADAR_CACHE_DIR, region)
-        log.info("radar %s %s (%d 幀, cached=%s)", region, t1, n, cached)
+        gen_s = time.monotonic() - t_gen
+        size_mb = os.path.getsize(sent) / 1e6
+        log.info("radar %s %s (%d 幀, cached=%s, 產生 %.1fs, %.1fMB)",
+                 region, t1, n, cached, gen_s, size_mb)
         caption = f"📡 {region}雷達回波 {t0[5:16].replace('T',' ')} ~ {t1[11:16]}（{n} 幀）"
         tmo = dict(read_timeout=300, write_timeout=300, connect_timeout=30, pool_timeout=60)
+        t_up = time.monotonic()
         with open(sent, "rb") as f:
             try:
                 if sent.endswith(".mp4"):
@@ -193,6 +198,8 @@ async def _send_radar(ctx, chat_id, region):
                                              supports_streaming=True, **tmo)
                 else:                               # 無 ffmpeg 退回 GIF
                     await ctx.bot.send_animation(chat_id, f, caption=caption, **tmo)
+                log.info("radar %s 上傳完成 %.1fs (%.1fMB)",
+                         region, time.monotonic() - t_up, size_mb)
             except TimedOut:
                 # client 等回應逾時, 但檔案通常已送達; 不自動重傳以免重複
                 log.warning("send timed out (影片可能已送達): %s", sent)
